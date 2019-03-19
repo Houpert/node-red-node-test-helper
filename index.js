@@ -13,33 +13,35 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  **/
+'use strict';
 
-var path = require("path");
-var sinon = require("sinon");
-var should = require("should");
-var when = require("when");
-var request = require('supertest');
-var express = require("express");
-var http = require('http');
-var stoppable = require('stoppable');
-var readPkgUp = require('read-pkg-up');
+const path = require("path");
+const sinon = require("sinon");
+const should = require('should');
+require('should-sinon');
+const when = require("when");
+const request = require('supertest');
+const express = require("express");
+const http = require('http');
+const stoppable = require('stoppable');
+const readPkgUp = require('read-pkg-up');
+const semver = require('semver');
+const EventEmitter = require('events').EventEmitter;
 
-var RED;
-var redNodes;
-var flows;
-var comms;
-var log;
-var context;
-var events;
-var credentials;
+const PROXY_METHODS = ['log', 'status', 'warn', 'error', 'debug', 'trace', 'send'];
 
-var runtimePath;
-
+/**
+ * Finds the NR runtime path by inspecting environment
+ */
 function findRuntimePath() {
     const upPkg = readPkgUp.sync();
     // case 1: we're in NR itself
     if (upPkg.pkg.name === 'node-red') {
-        return path.join(path.dirname(upPkg.path), upPkg.pkg.main);
+        if (checkSemver(upPkg.pkg.version,"<0.20.0")) {
+            return path.join(path.dirname(upPkg.path), upPkg.pkg.main);
+        } else {
+            return path.join(path.dirname(upPkg.path),"packages","node_modules","node-red");
+        }
     }
     // case 2: NR is resolvable from here
     try {
@@ -56,53 +58,91 @@ function findRuntimePath() {
     }
 }
 
-function initRuntime(requirePath) {
-
-    requirePath = requirePath || findRuntimePath();
-    if (!requirePath) {
-        return;
-    }
-
-    try {
-        RED = require(requirePath);
-
-        // public runtime API
-        redNodes = RED.nodes;
-        events = RED.events;
-        log = RED.log;
-
-        // access some private/internal Node-RED runtime
-        const prefix = path.dirname(requirePath);
-        context = require(path.join(prefix,'runtime','nodes','context'));
-        comms = require(path.join(prefix, 'api','editor','comms'));
-        credentials = require(path.join(prefix, 'runtime', 'nodes', 'credentials'));
-
-    } catch (err) {
-        // ignore, assume init will be called again by a test script supplying the runtime path
-    }
+// As we have prerelease tags in development version, they need stripping off
+// before semver will do a sensible comparison with a range.
+function checkSemver(localVersion,testRange) {
+    var parts = localVersion.split("-");
+    return semver.satisfies(parts[0],testRange);
 }
 
-initRuntime();
+class NodeTestHelper extends EventEmitter {
+    constructor() {
+        super();
 
-var app = express();
+        this._sandbox = sinon.createSandbox();
 
-var address = '127.0.0.1';
-var listenPort = 0; // use ephemeral port
-var port;
-var url;
-var logSpy;
-var server;
+        this._address = '127.0.0.1';
+        this._listenPort = 0; // ephemeral
 
-function helperNode(n) {
-    RED.nodes.createNode(this, n);
-}
+        this.init();
+    }
 
-module.exports = {
-    init: initRuntime,
-    load: function(testNode, testFlow, testCredentials, cb) {
-        var i;
+    _initRuntime(requirePath) {
+        try {
+            const RED = this._RED = require(requirePath);
+            // public runtime API
+            this._redNodes = RED.nodes;
+            this._events = RED.events;
+            this._log = RED.log;
+            // access internal Node-RED runtime methods
+            const prefix = path.dirname(requirePath);
+            if (checkSemver(RED.version(),"<0.20.0")) {
+                this._context = require(path.join(prefix, 'runtime', 'nodes', 'context'));
+                this._comms = require(path.join(prefix, 'api', 'editor', 'comms'));
+                this.credentials = require(path.join(prefix, 'runtime', 'nodes', 'credentials'));
+                // proxy the methods on Node.prototype to both be Sinon spies and asynchronously emit
+                // information about the latest call
+                this._NodePrototype = require(path.join(prefix, 'runtime', 'nodes', 'Node')).prototype;
+            } else {
+                // This is good enough for running it within the NR git repository - given the
+                // code layout changes. But it will need some more work when running in the other
+                // possible locations
+                this._context = require(path.join(prefix, '@node-red/runtime/lib/nodes/context'));
+                this._comms = require(path.join(prefix, '@node-red/editor-api/lib/editor/comms'));
+                this.credentials = require(path.join(prefix, '@node-red/runtime/lib/nodes/credentials'));
+                // proxy the methods on Node.prototype to both be Sinon spies and asynchronously emit
+                // information about the latest call
+                this._NodePrototype = require(path.join(prefix, '@node-red/runtime/lib/nodes/Node')).prototype;
+            }
+        } catch (ignored) {
+            console.log(ignored);
+            // ignore, assume init will be called again by a test script supplying the runtime path
+        }
+    }
 
-        logSpy = sinon.spy(log,"log");
+    init(runtimePath) {
+        runtimePath = runtimePath || findRuntimePath();
+        if (runtimePath) {
+            this._initRuntime(runtimePath);
+        }
+    }
+
+    /**
+     * Loads a flow then starts the flow.
+     * 
+     * @param {Object|Object[]} testNode - Module object of a node to be tested returned by require function. This node will be registered, and can be used in testFlows.
+     * @param {Object[]} testFlow - Flow data to test a node. If you want to use flow data exported from Node-RED editor, export the flow to the clipboard and paste the content into your test scripts.
+     * @param {Object} [testCredentials] - Optional node credentials. (Not optional when testSettings parameter is supplied, but may be undefined.)
+     * @param {Object} [testSettings] - Optional settings.
+     * @param {function} cb - Function to call back when testFlows has been started.
+     */
+    load(testNode, testFlow, testCredentials, testSettings, cb) {
+        if (arguments.length === 3) {
+            // function call was: load(testNode, testFlow, cb)
+            cb = testCredentials;
+            testSettings = { available: function() { return false; } };
+            testCredentials = {};
+        } else if (arguments.length === 4) {
+            // function call was: load(testNode, testFlow, testCredentials, cb)
+            cb = testSettings;
+            testSettings = { available: function() { return false; } };
+        } else if (testCredentials === undefined) {
+            // function call was: load(testNode, testFlow, undefined, testSettings, cb)
+            testCredentials = {};
+        }
+
+        const log = this._log;
+        const logSpy = this._logSpy = this._sandbox.spy(log, 'log');
         logSpy.FATAL = log.FATAL;
         logSpy.ERROR = log.ERROR;
         logSpy.WARN = log.WARN;
@@ -111,108 +151,138 @@ module.exports = {
         logSpy.TRACE = log.TRACE;
         logSpy.METRIC = log.METRIC;
 
-        if (typeof testCredentials === 'function') {
-            cb = testCredentials;
-            testCredentials = {};
-        }
+        const self = this;
+        PROXY_METHODS.forEach(methodName => {
+            const spy = this._sandbox.spy(self._NodePrototype, methodName);
+            self._NodePrototype[methodName] = new Proxy(spy, {
+                apply: (target, thisArg, args) => {
+                    const retval = Reflect.apply(target, thisArg, args);
+                    process.nextTick(function(call) { return () => {
+                            self._NodePrototype.emit.call(thisArg, `call:${methodName}`, call);
+                    }}(spy.lastCall));
+                    return retval;
+                }
+            });
+        });
 
         var storage = {
-            getFlows: function() {
+            getFlows: function () {
                 return when.resolve({flows:testFlow,credentials:testCredentials});
             }
         };
 
-        var settings = {
-            available: function() { return false; }
+        var red = {
+            _: v => v
         };
 
-        var red = {};
-        for (i in RED) {
-            if (RED.hasOwnProperty(i) && !/^(init|start|stop)$/.test(i)) {
-                var propDescriptor = Object.getOwnPropertyDescriptor(RED,i);
-                Object.defineProperty(red,i,propDescriptor);
-            }
-        }
+        Object.keys(this._RED).filter(prop => !/^(init|start|stop)$/.test(prop))
+            .forEach(prop => {
+                const propDescriptor = Object.getOwnPropertyDescriptor(this._RED, prop);
+                Object.defineProperty(red, prop, propDescriptor);
+            });
 
-        red["_"] = function(messageId) {
-            return messageId;
-        };
+        const redNodes = this._redNodes;
+        redNodes.init({
+            events: this._events,
+            settings: testSettings,
+            storage: storage,
+            log: this._log
+        });
+        redNodes.registerType("helper", function (n) {
+            redNodes.createNode(this, n);
+        });
 
-        redNodes.init({events:events,settings:settings, storage:storage,log:log,});
-        redNodes.registerType("helper", helperNode);
         if (Array.isArray(testNode)) {
-            for (i = 0; i < testNode.length; i++) {
-                testNode[i](red);
-            }
+            testNode.forEach(fn => {
+                fn(red);
+            });
         } else {
             testNode(red);
         }
-        redNodes.loadFlows().then(function() {
-            redNodes.startFlows();
-            should.deepEqual(testFlow, redNodes.getFlows().flows);
-            cb();
-        });
-    },
 
-    unload: function() {
+        redNodes.loadFlows()
+            .then(() => {
+                redNodes.startFlows();
+                should.deepEqual(testFlow, redNodes.getFlows().flows);
+                cb();
+            });
+    }
+
+    unload() {
         // TODO: any other state to remove between tests?
-        redNodes.clearRegistry();
-        logSpy.restore();
+        this._redNodes.clearRegistry();
+        this._logSpy.restore();
+        this._sandbox.restore();
+
         // internal API
-        context.clean({allNodes:[]});
-        return redNodes.stopFlows();
-    },
+        this._context.clean({allNodes:[]});
+        return this._redNodes.stopFlows();
+    }
 
-    getNode: function(id) {
-        return redNodes.getNode(id);
-    },
+    /**
+     * Returns a Node by id.
+     * @param {string} id - Node ID
+     * @returns {Node}
+     */
+    getNode(id) {
+        return this._redNodes.getNode(id);
+    }
 
-    credentials: credentials,
+    clearFlows() {
+        return this._redNodes.stopFlows();
+    }
 
-    clearFlows: function() {
-        return redNodes.stopFlows();
-    },
+    request() {
+        return request(this._RED.httpAdmin);
+    }
 
-    request: function() {
-        return request(RED.httpAdmin);
-    },
-
-    startServer: function(testSettings, done) {
+    startServer(testSettings, done) {
         let settings = { SKIP_BUILD_CHECK: true, logging: { console: { level: 'off' }}}
         if(done) {
             settings = { ...settings, ...testSettings}
         }else {
             done = testSettings
         }
+        
+        this._app = express();
+        const server = stoppable(http.createServer((req, res) => {
+            this._app(req, res);
+        }), 0);
 
-        server = stoppable(http.createServer(function(req,res) { app(req,res); }), 0);
-        RED.init(server, settings);
-        server.listen(listenPort, address);
-        server.on('listening', function() {
-            port = server.address().port;
-            url = 'http://' + address + ':' + port;
+        this._RED.init(server, settings);
+        server.listen(this._listenPort, this._address);
+        server.on('listening', () => {
+            this._port = server.address().port;
             // internal API
-            comms.start();
+            this._comms.start();
             done();
         });
-    },
+        this._server = server;
+    }
 
     //TODO consider saving TCP handshake/server reinit on start/stop/start sequences
-    stopServer: function(done) {
-        if (server) {
+    stopServer(done) {
+        if (this._server) {
             try {
                 // internal API
-                comms.stop();
-                server.stop(done);
-            } catch(e) {
+                this._comms.stop();
+                this._server.stop(done);
+            } catch (e) {
                 done();
             }
         } else {
             done();
         }
-    },
+    }
 
-    url: function() { return url; },
+    url() {
+        return `http://${this._address}:${this._port}`;
+    }
 
-    log: function() { return logSpy;}
-};
+    log() {
+        return this._logSpy;
+    }
+}
+
+module.exports = new NodeTestHelper();
+module.exports.NodeTestHelper = NodeTestHelper;
