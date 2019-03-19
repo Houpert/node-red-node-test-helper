@@ -179,14 +179,13 @@ module.exports = {
 
     startServer: function(testSettings, done) {
         let settings = { SKIP_BUILD_CHECK: true, logging: { console: { level: 'off' }}}
-        if(testSettings) {
+        if(done) {
             settings = { ...settings, ...testSettings}
-        } else {
+        }else {
             done = testSettings
         }
 
         server = stoppable(http.createServer(function(req,res) { app(req,res); }), 0);
-
         RED.init(server, settings);
         server.listen(listenPort, address);
         server.on('listening', function() {
