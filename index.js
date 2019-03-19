@@ -13,35 +13,33 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  **/
-'use strict';
 
-const path = require("path");
-const sinon = require("sinon");
-const should = require('should');
-require('should-sinon');
-const when = require("when");
-const request = require('supertest');
-const express = require("express");
-const http = require('http');
-const stoppable = require('stoppable');
-const readPkgUp = require('read-pkg-up');
-const semver = require('semver');
-const EventEmitter = require('events').EventEmitter;
+var path = require("path");
+var sinon = require("sinon");
+var should = require("should");
+var when = require("when");
+var request = require('supertest');
+var express = require("express");
+var http = require('http');
+var stoppable = require('stoppable');
+var readPkgUp = require('read-pkg-up');
 
-const PROXY_METHODS = ['log', 'status', 'warn', 'error', 'debug', 'trace', 'send'];
+var RED;
+var redNodes;
+var flows;
+var comms;
+var log;
+var context;
+var events;
+var credentials;
 
-/**
- * Finds the NR runtime path by inspecting environment
- */
+var runtimePath;
+
 function findRuntimePath() {
     const upPkg = readPkgUp.sync();
     // case 1: we're in NR itself
     if (upPkg.pkg.name === 'node-red') {
-        if (checkSemver(upPkg.pkg.version,"<0.20.0")) {
-            return path.join(path.dirname(upPkg.path), upPkg.pkg.main);
-        } else {
-            return path.join(path.dirname(upPkg.path),"packages","node_modules","node-red");
-        }
+        return path.join(path.dirname(upPkg.path), upPkg.pkg.main);
     }
     // case 2: NR is resolvable from here
     try {
@@ -58,74 +56,53 @@ function findRuntimePath() {
     }
 }
 
+function initRuntime(requirePath) {
 
-// As we have prerelease tags in development version, they need stripping off
-// before semver will do a sensible comparison with a range.
-function checkSemver(localVersion,testRange) {
-    var parts = localVersion.split("-");
-    return semver.satisfies(parts[0],testRange);
+    requirePath = requirePath || findRuntimePath();
+    if (!requirePath) {
+        return;
+    }
+
+    try {
+        RED = require(requirePath);
+
+        // public runtime API
+        redNodes = RED.nodes;
+        events = RED.events;
+        log = RED.log;
+
+        // access some private/internal Node-RED runtime
+        const prefix = path.dirname(requirePath);
+        context = require(path.join(prefix,'runtime','nodes','context'));
+        comms = require(path.join(prefix, 'api','editor','comms'));
+        credentials = require(path.join(prefix, 'runtime', 'nodes', 'credentials'));
+
+    } catch (err) {
+        // ignore, assume init will be called again by a test script supplying the runtime path
+    }
 }
 
-class NodeTestHelper extends EventEmitter {
-    constructor() {
-        super();
+initRuntime();
 
-        this._sandbox = sinon.createSandbox();
+var app = express();
 
-        this._address = '127.0.0.1';
-        this._listenPort = 0; // ephemeral
+var address = '127.0.0.1';
+var listenPort = 0; // use ephemeral port
+var port;
+var url;
+var logSpy;
+var server;
 
-        this.init();
-    }
+function helperNode(n) {
+    RED.nodes.createNode(this, n);
+}
 
-    _initRuntime(requirePath) {
-        try {
-            const RED = this._RED = require(requirePath);
-            // public runtime API
-            this._log = RED.log;
-            // access internal Node-RED runtime methods
-            const prefix = path.dirname(requirePath);
-            if (checkSemver(RED.version(),"<0.20.0")) {
-                this._settings = RED.settings;
-                this._events = RED.events;
-                this._redNodes = RED.nodes;
-                this._context = require(path.join(prefix, 'runtime', 'nodes', 'context'));
-                this._comms = require(path.join(prefix, 'api', 'editor', 'comms'));
-                this.credentials = require(path.join(prefix, 'runtime', 'nodes', 'credentials'));
-                // proxy the methods on Node.prototype to both be Sinon spies and asynchronously emit
-                // information about the latest call
-                this._NodePrototype = require(path.join(prefix, 'runtime', 'nodes', 'Node')).prototype;
-            } else {
-                // This is good enough for running it within the NR git repository - given the
-                // code layout changes. But it will need some more work when running in the other
-                // possible locations
-                this._redNodes = require(path.join(prefix, '@node-red/runtime/lib/nodes'));
-                this._settings = RED.settings;
-                this._events = RED.runtime.events;
-                this._context = require(path.join(prefix, '@node-red/runtime/lib/nodes/context'));
-                this._comms = require(path.join(prefix, '@node-red/editor-api/lib/editor/comms'));
-                this._registryUtil = require(path.join(prefix, '@node-red/registry/lib/util'));
-                this.credentials = require(path.join(prefix, '@node-red/runtime/lib/nodes/credentials'));
-                // proxy the methods on Node.prototype to both be Sinon spies and asynchronously emit
-                // information about the latest call
-                this._NodePrototype = require(path.join(prefix, '@node-red/runtime/lib/nodes/Node')).prototype;
-            }
-        } catch (ignored) {
-            console.log(ignored);
-            // ignore, assume init will be called again by a test script supplying the runtime path
-        }
-    }
+module.exports = {
+    init: initRuntime,
+    load: function(testNode, testFlow, testCredentials, cb) {
+        var i;
 
-    init(runtimePath) {
-        runtimePath = runtimePath || findRuntimePath();
-        if (runtimePath) {
-            this._initRuntime(runtimePath);
-        }
-    }
-
-    load(testNode, testFlow, testCredentials, cb) {
-        const log = this._log;
-        const logSpy = this._logSpy = this._sandbox.spy(log, 'log');
+        logSpy = sinon.spy(log,"log");
         logSpy.FATAL = log.FATAL;
         logSpy.ERROR = log.ERROR;
         logSpy.WARN = log.WARN;
@@ -134,157 +111,109 @@ class NodeTestHelper extends EventEmitter {
         logSpy.TRACE = log.TRACE;
         logSpy.METRIC = log.METRIC;
 
-        const self = this;
-        PROXY_METHODS.forEach(methodName => {
-            const spy = this._sandbox.spy(self._NodePrototype, methodName);
-            self._NodePrototype[methodName] = new Proxy(spy, {
-                apply: (target, thisArg, args) => {
-                    const retval = Reflect.apply(target, thisArg, args);
-                    process.nextTick(function(call) { return () => {
-                            self._NodePrototype.emit.call(thisArg, `call:${methodName}`, call);
-                    }}(spy.lastCall));
-                    return retval;
-                }
-            });
-        });
-
-
-
         if (typeof testCredentials === 'function') {
             cb = testCredentials;
             testCredentials = {};
         }
 
         var storage = {
-            getFlows: function () {
+            getFlows: function() {
                 return when.resolve({flows:testFlow,credentials:testCredentials});
             }
         };
-        // this._settings.logging = {console:{level:'off'}};
-        this._settings.available = function() { return false; }
 
-        const redNodes = this._redNodes;
-        this._httpAdmin = express();
-        const mockRuntime = {
-            nodes: redNodes,
-            events: this._events,
-            util: this._RED.util,
-            settings: this._settings,
-            storage: storage,
-            log: this._log,
-            nodeApp: express(),
-            adminApp: this._httpAdmin,
-            library: {register: function() {}},
-            get server() { return self._server }
+        var settings = {
+            available: function() { return false; }
+        };
+
+        var red = {};
+        for (i in RED) {
+            if (RED.hasOwnProperty(i) && !/^(init|start|stop)$/.test(i)) {
+                var propDescriptor = Object.getOwnPropertyDescriptor(RED,i);
+                Object.defineProperty(red,i,propDescriptor);
+            }
         }
 
-        redNodes.init(mockRuntime);
-        redNodes.registerType("helper", function (n) {
-            redNodes.createNode(this, n);
-        });
+        red["_"] = function(messageId) {
+            return messageId;
+        };
 
-        var red;
-        if (this._registryUtil) {
-            this._registryUtil.init(mockRuntime);
-            red = this._registryUtil.createNodeApi({});
-            red._ = v=>v;
-            red.settings = this._settings;
-        } else {
-            red = {
-                _: v => v
-            };
-            Object.keys(this._RED).filter(prop => !/^(init|start|stop)$/.test(prop))
-                .forEach(prop => {
-                    const propDescriptor = Object.getOwnPropertyDescriptor(this._RED, prop);
-                    Object.defineProperty(red, prop, propDescriptor);
-                });
-        }
-
+        redNodes.init({events:events,settings:settings, storage:storage,log:log,});
+        redNodes.registerType("helper", helperNode);
         if (Array.isArray(testNode)) {
-            testNode.forEach(fn => {
-                fn(red);
-            });
+            for (i = 0; i < testNode.length; i++) {
+                testNode[i](red);
+            }
         } else {
             testNode(red);
         }
-        redNodes.loadFlows()
-            .then(() => {
-                redNodes.startFlows();
-                should.deepEqual(testFlow, redNodes.getFlows().flows);
-                cb();
-            });
-    }
-
-    unload() {
-        // TODO: any other state to remove between tests?
-        this._redNodes.clearRegistry();
-        this._logSpy.restore();
-        this._sandbox.restore();
-
-        // internal API
-        this._context.clean({allNodes:[]});
-        return this._redNodes.stopFlows();
-    }
-
-    /**
-     * Returns a Node by id.
-     * @param {string} id - Node ID
-     * @returns {Node}
-     */
-    getNode(id) {
-        return this._redNodes.getNode(id);
-    }
-
-    clearFlows() {
-        return this._redNodes.stopFlows();
-    }
-
-    request() {
-        return request(this._httpAdmin);
-    }
-
-    startServer(done) {
-        this._app = express();
-        const server = stoppable(http.createServer((req, res) => {
-            this._app(req, res);
-        }), 0);
-
-        this._RED.init(server,{
-            logging:{console:{level:'off'}}
+        redNodes.loadFlows().then(function() {
+            redNodes.startFlows();
+            should.deepEqual(testFlow, redNodes.getFlows().flows);
+            cb();
         });
-        server.listen(this._listenPort, this._address);
-        server.on('listening', () => {
-            this._port = server.address().port;
+    },
+
+    unload: function() {
+        // TODO: any other state to remove between tests?
+        redNodes.clearRegistry();
+        logSpy.restore();
+        // internal API
+        context.clean({allNodes:[]});
+        return redNodes.stopFlows();
+    },
+
+    getNode: function(id) {
+        return redNodes.getNode(id);
+    },
+
+    credentials: credentials,
+
+    clearFlows: function() {
+        return redNodes.stopFlows();
+    },
+
+    request: function() {
+        return request(RED.httpAdmin);
+    },
+
+    startServer: function(testSettings, done) {
+        let settings = { SKIP_BUILD_CHECK: true, logging: { console: { level: 'off' }}}
+        if(testSettings) {
+            settings = { ...settings, ...testSettings}
+        } else {
+            done = testSettings
+        }
+
+        server = stoppable(http.createServer(function(req,res) { app(req,res); }), 0);
+
+        RED.init(server, settings);
+        server.listen(listenPort, address);
+        server.on('listening', function() {
+            port = server.address().port;
+            url = 'http://' + address + ':' + port;
             // internal API
-            this._comms.start();
+            comms.start();
             done();
         });
-        this._server = server;
-    }
+    },
 
     //TODO consider saving TCP handshake/server reinit on start/stop/start sequences
-    stopServer(done) {
-        if (this._server) {
+    stopServer: function(done) {
+        if (server) {
             try {
                 // internal API
-                this._comms.stop();
-                this._server.stop(done);
-            } catch (e) {
+                comms.stop();
+                server.stop(done);
+            } catch(e) {
                 done();
             }
         } else {
             done();
         }
-    }
+    },
 
-    url() {
-        return `http://${this._address}:${this._port}`;
-    }
+    url: function() { return url; },
 
-    log() {
-        return this._logSpy;
-    }
-}
-
-module.exports = new NodeTestHelper();
-module.exports.NodeTestHelper = NodeTestHelper;
+    log: function() { return logSpy;}
+};
